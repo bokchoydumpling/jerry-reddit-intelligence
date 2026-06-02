@@ -5,16 +5,9 @@ import MetricCard from '@/components/dashboard/MetricCard'
 import SentimentTrend from '@/components/dashboard/SentimentTrend'
 import TopMentions from '@/components/dashboard/TopMentions'
 import IngestButton from '@/components/dashboard/IngestButton'
-import DateRangePicker, { DEFAULT_RANGE, RANGE_OPTIONS } from '@/components/dashboard/DateRangePicker'
-import type { RangeValue } from '@/components/dashboard/DateRangePicker'
-
-function rangeLabel(value: RangeValue): string {
-  return RANGE_OPTIONS.find((o) => o.value === value)?.label ?? 'Last 30 days'
-}
-
-function sinceDate(days: number): string {
-  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString()
-}
+import DateRangePicker from '@/components/dashboard/DateRangePicker'
+import { RANGE_OPTIONS, DEFAULT_RANGE, rangeLabel, sinceDate } from '@/lib/date-range'
+import type { RangeValue } from '@/lib/date-range'
 
 export default async function DashboardPage({
   searchParams,

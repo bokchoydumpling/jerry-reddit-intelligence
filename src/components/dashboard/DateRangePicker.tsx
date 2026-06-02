@@ -1,17 +1,11 @@
 'use client'
 
 import { useRouter, useSearchParams, usePathname } from 'next/navigation'
+import { RANGE_OPTIONS, DEFAULT_RANGE } from '@/lib/date-range'
+import type { RangeValue } from '@/lib/date-range'
 
-export const RANGE_OPTIONS = [
-  { label: 'Last 7 days',    value: '7'   },
-  { label: 'Last 30 days',   value: '30'  },
-  { label: 'Last 90 days',   value: '90'  },
-  { label: 'Last 6 months',  value: '180' },
-  { label: 'Last 1 year',    value: '365' },
-] as const
-
-export type RangeValue = typeof RANGE_OPTIONS[number]['value']
-export const DEFAULT_RANGE: RangeValue = '30'
+export { RANGE_OPTIONS, DEFAULT_RANGE }
+export type { RangeValue }
 
 export default function DateRangePicker() {
   const router = useRouter()

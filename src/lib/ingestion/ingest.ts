@@ -1,25 +1,33 @@
 /**
  * Ingestion entry point.
- * Strategy: one Apify actor run across all target subreddits, then keyword-match client-side.
- * Comment fetching uses Reddit public JSON as a best-effort supplement.
+ *
+ * Strategy (both phases run every ingestion):
+ *
+ * PHASE 1 — Search-first (PRIMARY)
+ *   Call Reddit's search JSON for each user keyword + brand terms.
+ *   Finds mentions anywhere on Reddit, not just in a fixed subreddit list.
+ *   Works reliably from Vercel Lambda (rotating IPs) even when blocked locally.
+ *
+ * PHASE 2 — Subreddit scan (SECONDARY via Apify)
+ *   Runs one Apify actor call across all target subreddits.
+ *   Catches volume data and posts that search might miss.
+ *   Apify bypasses Reddit IP restrictions entirely.
+ *
+ * Swap reddit-fetcher.ts (not this file) to change the data source.
  */
-import { createClient } from '@supabase/supabase-js'
-import { fetchSubreddits, fetchPostComments } from './reddit-fetcher'
+import { createClient, type SupabaseClient } from '@supabase/supabase-js'
+import { searchReddit, fetchSubreddits, fetchPostComments } from './reddit-fetcher'
 import { matchKeywords } from './keyword-matcher'
-import type { IngestResult } from './types'
+import type { IngestResult, RedditPost } from './types'
 
-const TARGET_SUBREDDITS = [
-  'insurance',
-  'carinsurance',
-  'personalfinance',
-  'cars',
-  'askcars',
-  'frugal',
-  'legaladvice',
-  'mildlyinfuriating',
-  'povertyfinance',
-  'AutoInsurance',
+const SECONDARY_SUBREDDITS = [
+  'insurance', 'carinsurance', 'AutoInsurance',
+  'personalfinance', 'cars', 'askcars',
+  'frugal', 'legaladvice',
 ]
+
+// Always-on brand search terms (in addition to user keywords)
+const BRAND_TERMS = ['jerry insurance', '"jerry app"', 'getjerry', 'jerry.com insurance']
 
 function serviceClient() {
   return createClient(
@@ -28,8 +36,39 @@ function serviceClient() {
   )
 }
 
+async function upsertMention(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  supabase: SupabaseClient<any>,
+  post: RedditPost,
+  userId: string,
+  keywordId: string
+): Promise<'inserted' | 'skipped' | 'error'> {
+  const { data: existing } = await supabase
+    .from('reddit_mentions')
+    .select('id')
+    .eq('reddit_id', post.id)
+    .single()
+
+  if (existing) return 'skipped'
+
+  const { error } = await supabase.from('reddit_mentions').insert({
+    reddit_id:  post.id,
+    user_id:    userId,
+    keyword_id: keywordId,
+    subreddit:  post.subreddit,
+    title:      post.title,
+    body:       post.selftext || post.title,
+    url:        post.url || `https://www.reddit.com${post.permalink}`,
+    score:      post.score,
+    is_post:    true,
+    created_at: new Date(post.created_utc * 1000).toISOString(),
+  })
+
+  return error ? 'error' : 'inserted'
+}
+
 export async function ingest(
-  subreddits: string[] = TARGET_SUBREDDITS,
+  subreddits: string[] = SECONDARY_SUBREDDITS,
   userId: string
 ): Promise<IngestResult> {
   const supabase = serviceClient()
@@ -46,67 +85,67 @@ export async function ingest(
     return result
   }
 
-  // One batched Apify run across all subreddits
-  let posts
-  try {
-    posts = await fetchSubreddits(subreddits, subreddits.length * 30)
-    result.fetched = posts.length
-    result.errors.push(`[apify] fetched ${posts.length} posts across ${subreddits.length} subreddits`)
-  } catch (err) {
-    result.errors.push(`[apify] run failed: ${(err as Error).message.slice(0, 200)}`)
-    return result
+  const seen = new Set<string>()
+  const allPosts: RedditPost[] = []
+
+  // ── PHASE 1: Reddit search (primary) ──────────────────────────────────────
+  const searchTerms = [...BRAND_TERMS, ...keywords.map((k) => k.term)]
+
+  for (const term of searchTerms) {
+    try {
+      const posts = await searchReddit(term, 'new', 25)
+      let added = 0
+      for (const p of posts) {
+        if (!seen.has(p.id)) { seen.add(p.id); allPosts.push(p); added++ }
+      }
+      result.errors.push(`[search] "${term}" → ${posts.length} posts (${added} new)`)
+    } catch (err) {
+      result.errors.push(`[search] "${term}" failed: ${(err as Error).message.slice(0, 100)}`)
+    }
+    await new Promise((r) => setTimeout(r, 500))
   }
 
-  for (const post of posts) {
+  // ── PHASE 2: Apify subreddit scan (secondary) ─────────────────────────────
+  try {
+    const posts = await fetchSubreddits(subreddits, subreddits.length * 35)
+    let added = 0
+    for (const p of posts) {
+      if (!seen.has(p.id)) { seen.add(p.id); allPosts.push(p); added++ }
+    }
+    result.errors.push(`[apify] scanned ${subreddits.length} subreddits → ${posts.length} posts (${added} new)`)
+  } catch (err) {
+    result.errors.push(`[apify] failed: ${(err as Error).message.slice(0, 150)}`)
+  }
+
+  result.fetched = allPosts.length
+
+  // ── Persist matched posts ─────────────────────────────────────────────────
+  for (const post of allPosts) {
     const fullText = `${post.title} ${post.selftext}`
     const matchedKw = matchKeywords(fullText, keywords)
     if (!matchedKw) continue
 
-    // Upsert thread
+    // Upsert thread record
     await supabase.from('reddit_threads').upsert(
       {
-        reddit_id: post.id,
-        subreddit: post.subreddit,
-        title: post.title,
-        url: post.url || `https://www.reddit.com${post.permalink}`,
+        reddit_id:       post.id,
+        subreddit:       post.subreddit,
+        title:           post.title,
+        url:             post.url || `https://www.reddit.com${post.permalink}`,
         author_username: post.author,
-        score: post.score,
-        num_comments: post.num_comments,
-        fetched_at: new Date().toISOString(),
+        score:           post.score,
+        num_comments:    post.num_comments,
+        fetched_at:      new Date().toISOString(),
       },
       { onConflict: 'reddit_id', ignoreDuplicates: false }
     )
 
-    const { data: existing } = await supabase
-      .from('reddit_mentions')
-      .select('id')
-      .eq('reddit_id', post.id)
-      .single()
+    const outcome = await upsertMention(supabase, post, userId, matchedKw.id)
+    if (outcome === 'inserted') result.inserted++
+    else if (outcome === 'skipped') result.skipped++
 
-    if (existing) {
-      result.skipped++
-    } else {
-      const { error } = await supabase.from('reddit_mentions').insert({
-        reddit_id: post.id,
-        user_id: userId,
-        keyword_id: matchedKw.id,
-        subreddit: post.subreddit,
-        title: post.title,
-        body: post.selftext || post.title,
-        url: post.url || `https://www.reddit.com${post.permalink}`,
-        score: post.score,
-        is_post: true,
-        created_at: new Date(post.created_utc * 1000).toISOString(),
-      })
-      if (error) {
-        result.errors.push(`Post ${post.id}: ${error.message}`)
-      } else {
-        result.inserted++
-      }
-    }
-
-    // Best-effort comment scan via public JSON
-    if (post.num_comments > 0 && post.subreddit && post.id) {
+    // Best-effort comment scan for matched posts
+    if (post.num_comments > 0 && post.id && post.subreddit) {
       const comments = await fetchPostComments(post.subreddit, post.id, 10)
       for (const comment of comments) {
         if (!matchKeywords(comment.body, keywords)) continue
@@ -118,26 +157,21 @@ export async function ingest(
           .eq('reddit_id', comment.id)
           .single()
 
-        if (existingC) {
-          result.skipped++
-        } else {
-          const { error: ce } = await supabase.from('reddit_mentions').insert({
-            reddit_id: comment.id,
-            user_id: userId,
-            keyword_id: matchedKw.id,
-            subreddit: post.subreddit,
-            body: comment.body,
-            url: `https://www.reddit.com/r/${post.subreddit}/comments/${post.id}/`,
-            score: comment.score,
-            is_post: false,
-            created_at: new Date(comment.created_utc * 1000).toISOString(),
-          })
-          if (ce) {
-            result.errors.push(`Comment ${comment.id}: ${ce.message}`)
-          } else {
-            result.inserted++
-          }
-        }
+        if (existingC) { result.skipped++; continue }
+
+        const { error: ce } = await supabase.from('reddit_mentions').insert({
+          reddit_id:  comment.id,
+          user_id:    userId,
+          keyword_id: matchedKw.id,
+          subreddit:  post.subreddit,
+          body:       comment.body,
+          url:        `https://www.reddit.com/r/${post.subreddit}/comments/${post.id}/`,
+          score:      comment.score,
+          is_post:    false,
+          created_at: new Date(comment.created_utc * 1000).toISOString(),
+        })
+        if (ce) result.errors.push(`Comment ${comment.id}: ${ce.message}`)
+        else result.inserted++
       }
     }
   }

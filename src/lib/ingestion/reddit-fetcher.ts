@@ -1,44 +1,91 @@
-import type { RedditPost, RedditComment } from './types'
+import { ApifyClient } from 'apify-client';
 
-const BASE_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (compatible; Jerry-Intelligence/1.0)',
-  Accept: 'application/json',
+const client = new ApifyClient({ token: process.env.APIFY_API_KEY });
+
+const ACTOR_ID = 'trudax/reddit-scraper';
+
+interface ApifyItem {
+  id?: string;
+  title?: string;
+  selftext?: string;
+  body?: string;
+  author?: string;
+  subreddit?: string;
+  url?: string;
+  permalink?: string;
+  score?: number;
+  num_comments?: number;
+  created_utc?: number;
+  upvote_ratio?: number;
+  link_flair_text?: string;
 }
 
-async function fetchJSON(url: string): Promise<unknown> {
-  const res = await fetch(url, {
-    headers: BASE_HEADERS,
-    next: { revalidate: 0 },
-  })
-
-  if (!res.ok) throw new Error(`Reddit fetch failed: ${res.status} ${url}`)
-  return res.json()
+async function runActor(input: Record<string, unknown>) {
+  const run = await client.actor(ACTOR_ID).call(input);
+  const { items } = await client.dataset(run.defaultDatasetId).listItems();
+  return items as ApifyItem[];
 }
 
-export async function fetchNewPosts(subreddit: string, limit = 25): Promise<RedditPost[]> {
-  const url = `https://www.reddit.com/r/${subreddit}/new.json?limit=${limit}&raw_json=1`
-  const data = await fetchJSON(url) as { data: { children: { data: RedditPost }[] } }
-  return data.data.children.map((c) => c.data)
+function normalize(items: ApifyItem[]) {
+  return items
+    .filter(i => i.title)
+    .map(i => ({
+      id: i.id ?? crypto.randomUUID(),
+      title: i.title ?? '',
+      selftext: i.selftext ?? i.body ?? '',
+      author: i.author ?? '[deleted]',
+      subreddit: i.subreddit ?? '',
+      url: i.url ?? `https://reddit.com${i.permalink ?? ''}`,
+      permalink: i.permalink ?? '',
+      score: i.score ?? 0,
+      num_comments: i.num_comments ?? 0,
+      created_utc: i.created_utc ?? Date.now() / 1000,
+      upvote_ratio: i.upvote_ratio,
+      link_flair_text: i.link_flair_text,
+    }));
 }
 
-export async function fetchHotPosts(subreddit: string, limit = 25): Promise<RedditPost[]> {
-  const url = `https://www.reddit.com/r/${subreddit}/hot.json?limit=${limit}&raw_json=1`
-  const data = await fetchJSON(url) as { data: { children: { data: RedditPost }[] } }
-  return data.data.children.map((c) => c.data)
+export async function fetchNewPosts(subreddit: string, limit = 25) {
+  const items = await runActor({
+    startUrls: [{ url: `https://www.reddit.com/r/${subreddit}/new/` }],
+    maxItems: limit,
+    proxy: { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] },
+  });
+  return normalize(items);
 }
 
-export async function fetchPostComments(subreddit: string, postId: string, limit = 20): Promise<RedditComment[]> {
-  const url = `https://www.reddit.com/r/${subreddit}/comments/${postId}.json?limit=${limit}&raw_json=1`
-  const data = await fetchJSON(url) as [unknown, { data: { children: { data: RedditComment }[] } }]
-  const commentListing = data[1]
-  return commentListing.data.children
-    .map((c) => c.data)
-    .filter((c) => c.body && c.body !== '[deleted]' && c.body !== '[removed]')
+export async function fetchHotPosts(subreddit: string, limit = 25) {
+  const items = await runActor({
+    startUrls: [{ url: `https://www.reddit.com/r/${subreddit}/hot/` }],
+    maxItems: limit,
+    proxy: { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] },
+  });
+  return normalize(items);
 }
 
-export async function searchReddit(query: string, subreddit?: string, limit = 25): Promise<RedditPost[]> {
-  const sr = subreddit ? `+site:reddit.com/r/${subreddit}` : ''
-  const url = `https://www.reddit.com/search.json?q=${encodeURIComponent(query + sr)}&limit=${limit}&sort=new&raw_json=1`
-  const data = await fetchJSON(url) as { data: { children: { data: RedditPost }[] } }
-  return data.data.children.map((c) => c.data)
+export async function fetchPostComments(subreddit: string, postId: string, limit = 20) {
+  const items = await runActor({
+    startUrls: [{ url: `https://www.reddit.com/r/${subreddit}/comments/${postId}/` }],
+    maxItems: limit,
+    proxy: { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] },
+  });
+  return items
+    .filter(i => i.body && i.body !== '[deleted]' && i.body !== '[removed]')
+    .map(i => ({
+      id: i.id ?? crypto.randomUUID(),
+      body: i.body ?? '',
+      author: i.author ?? '[deleted]',
+      score: i.score ?? 0,
+      created_utc: i.created_utc ?? Date.now() / 1000,
+    }));
+}
+
+export async function searchReddit(query: string, subreddit?: string, limit = 25) {
+  const sr = subreddit ? `+site:reddit.com/r/${subreddit}` : '';
+  const items = await runActor({
+    searches: [{ term: query + sr, sort: 'new' }],
+    maxItems: limit,
+    proxy: { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] },
+  });
+  return normalize(items);
 }

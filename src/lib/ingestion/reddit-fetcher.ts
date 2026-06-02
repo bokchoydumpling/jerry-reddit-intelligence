@@ -1,91 +1,102 @@
-import { ApifyClient } from 'apify-client';
+/**
+ * Reddit data source — Apify macheta/super-fast-reddit-scraper.
+ * Swap this file (and only this file) to change the data source.
+ *
+ * Actor docs: runs from subreddit or post URLs; does NOT support search URLs.
+ * We batch all subreddit URLs into a single actor run to minimise credit use.
+ */
+import { ApifyClient } from 'apify-client'
+import type { RedditPost } from './types'
 
-const client = new ApifyClient({ token: process.env.APIFY_API_KEY });
+const client = new ApifyClient({ token: process.env.APIFY_API_KEY })
+const ACTOR_ID = 'macheta/super-fast-reddit-scraper'
 
-const ACTOR_ID = 'trudax/reddit-scraper';
-
-interface ApifyItem {
-  id?: string;
-  title?: string;
-  selftext?: string;
-  body?: string;
-  author?: string;
-  subreddit?: string;
-  url?: string;
-  permalink?: string;
-  score?: number;
-  num_comments?: number;
-  created_utc?: number;
-  upvote_ratio?: number;
-  link_flair_text?: string;
+interface ActorItem {
+  type?: string
+  id?: string
+  subreddit?: string
+  title?: string
+  author?: string
+  created_utc?: number
+  score?: number
+  num_comments?: number
+  url?: string
+  selftext?: string
+  permalink?: string
+  body?: string            // comments use this field
+  is_self?: boolean
 }
 
-async function runActor(input: Record<string, unknown>) {
-  const run = await client.actor(ACTOR_ID).call(input);
-  const { items } = await client.dataset(run.defaultDatasetId).listItems();
-  return items as ApifyItem[];
-}
+/** Fetch recent posts from a batch of subreddits in one actor invocation. */
+export async function fetchSubreddits(
+  subreddits: string[],
+  maxItemsTotal = 300
+): Promise<RedditPost[]> {
+  const startUrls = subreddits.map((sr) => ({
+    url: `https://www.reddit.com/r/${sr}/new/`,
+  }))
 
-function normalize(items: ApifyItem[]) {
-  return items
-    .filter(i => i.title)
-    .map(i => ({
-      id: i.id ?? crypto.randomUUID(),
-      title: i.title ?? '',
-      selftext: i.selftext ?? i.body ?? '',
-      author: i.author ?? '[deleted]',
+  const run = await client.actor(ACTOR_ID).call(
+    { startUrls, maxItems: maxItemsTotal },
+    { waitSecs: 180 }
+  )
+
+  const { items } = await client.dataset(run.defaultDatasetId).listItems()
+
+  return (items as ActorItem[])
+    .filter((i) => i.type === 'post' && i.id)
+    .map((i) => ({
+      id: i.id!,
+      name: `t3_${i.id}`,
       subreddit: i.subreddit ?? '',
-      url: i.url ?? `https://reddit.com${i.permalink ?? ''}`,
-      permalink: i.permalink ?? '',
+      title: i.title ?? '',
+      selftext: i.selftext ?? '',
+      url: i.url ?? '',
+      author: i.author ?? '[deleted]',
       score: i.score ?? 0,
       num_comments: i.num_comments ?? 0,
-      created_utc: i.created_utc ?? Date.now() / 1000,
-      upvote_ratio: i.upvote_ratio,
-      link_flair_text: i.link_flair_text,
-    }));
+      created_utc: i.created_utc ?? Math.floor(Date.now() / 1000),
+      permalink: i.permalink ?? '',
+      is_self: i.is_self ?? true,
+    }))
 }
 
-export async function fetchNewPosts(subreddit: string, limit = 25) {
-  const items = await runActor({
-    startUrls: [{ url: `https://www.reddit.com/r/${subreddit}/new/` }],
-    maxItems: limit,
-    proxy: { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] },
-  });
-  return normalize(items);
+// Legacy single-subreddit helpers used by ingest.ts — delegate to batch call
+export async function fetchNewPosts(subreddit: string, limit = 25): Promise<RedditPost[]> {
+  return fetchSubreddits([subreddit], limit)
 }
 
-export async function fetchHotPosts(subreddit: string, limit = 25) {
-  const items = await runActor({
-    startUrls: [{ url: `https://www.reddit.com/r/${subreddit}/hot/` }],
-    maxItems: limit,
-    proxy: { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] },
-  });
-  return normalize(items);
+export async function fetchHotPosts(subreddit: string, limit = 25): Promise<RedditPost[]> {
+  return fetchSubreddits([subreddit], limit)
 }
 
-export async function fetchPostComments(subreddit: string, postId: string, limit = 20) {
-  const items = await runActor({
-    startUrls: [{ url: `https://www.reddit.com/r/${subreddit}/comments/${postId}/` }],
-    maxItems: limit,
-    proxy: { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] },
-  });
-  return items
-    .filter(i => i.body && i.body !== '[deleted]' && i.body !== '[removed]')
-    .map(i => ({
-      id: i.id ?? crypto.randomUUID(),
-      body: i.body ?? '',
-      author: i.author ?? '[deleted]',
-      score: i.score ?? 0,
-      created_utc: i.created_utc ?? Date.now() / 1000,
-    }));
-}
+/**
+ * Fetch comments for a specific post via Reddit's public JSON endpoint.
+ * Falls back gracefully if Reddit blocks the IP.
+ */
+export async function fetchPostComments(
+  subreddit: string,
+  postId: string,
+  limit = 20
+): Promise<{ id: string; body: string; author: string; score: number; created_utc: number; subreddit: string }[]> {
+  try {
+    const url = `https://www.reddit.com/r/${subreddit}/comments/${postId}.json?limit=${limit}&raw_json=1`
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        Accept: 'application/json',
+      },
+      cache: 'no-store',
+    })
+    const text = await res.text()
+    if (!text.trimStart().startsWith('[')) return []
 
-export async function searchReddit(query: string, subreddit?: string, limit = 25) {
-  const sr = subreddit ? `+site:reddit.com/r/${subreddit}` : '';
-  const items = await runActor({
-    searches: [{ term: query + sr, sort: 'new' }],
-    maxItems: limit,
-    proxy: { useApifyProxy: true, apifyProxyGroups: ['RESIDENTIAL'] },
-  });
-  return normalize(items);
+    const data = JSON.parse(text) as [unknown, { data: { children: { data: { id: string; body: string; author: string; score: number; created_utc: number } }[] } }]
+    return data[1].data.children
+      .map((c) => c.data)
+      .filter((c) => c.body && c.body !== '[deleted]' && c.body !== '[removed]')
+      .map((c) => ({ ...c, subreddit }))
+  } catch {
+    return []
+  }
 }
